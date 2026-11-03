@@ -1,0 +1,280 @@
+#!/bin/bash
+# aiw — osobisty workflow dla agenta AI: spec → testy → implementacja → audyt.
+# Wszystkie dane projektu trzymane są poza repozytorium:
+#   ~/.claude/ai-workflow-data/projects/<slug>/{config.sh,specs/,state/}
+set -u
+
+AIW_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AIW_DATA="${AIW_DATA:-$HOME/.claude/ai-workflow-data}"
+
+project_root() {
+  local dir="${AIW_PROJECT:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+  git -C "$dir" rev-parse --show-toplevel 2>/dev/null || echo "$dir"
+}
+
+ROOT="$(project_root)"
+SLUG="$(echo "$ROOT" | sed 's#[/ ]#-#g')"
+PDIR="$AIW_DATA/projects/$SLUG"
+STATE="$PDIR/state"
+CONFIG="$PDIR/config.sh"
+mkdir -p "$STATE" "$PDIR/specs"
+
+AIW_TEST_CMD=""
+AIW_TEST_GLOBS="*Tests/* *Tests.swift */__Snapshots__/*"
+AIW_HIGH_RISK_GLOBS=""
+AIW_LINT_CMD=""
+AIW_MAX_STOP_BLOCKS=6
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+fail() { echo "ERROR: $*"; exit 1; }
+
+is_active() { [ -f "$STATE/active" ]; }
+
+current_spec() { [ -f "$STATE/current" ] && cat "$STATE/current"; }
+
+base_commit() { [ -f "$STATE/base" ] && cat "$STATE/base"; }
+
+# Ścieżka względem korzenia projektu (akceptuje absolutną lub względną).
+rel_path() {
+  local p="$1"
+  case "$p" in
+    "$ROOT"/*) echo "${p#"$ROOT"/}" ;;
+    /*) echo "$p" ;;
+    *) echo "${p#./}" ;;
+  esac
+}
+
+# match_globs <ścieżka-względna> <lista-globów>
+match_globs() {
+  local path="$1" globs="$2" g
+  set -f
+  for g in $globs; do
+    # shellcheck disable=SC2053
+    if [[ "$path" == $g ]]; then set +f; return 0; fi
+  done
+  set +f
+  return 1
+}
+
+all_files() { git -C "$ROOT" ls-files -co --exclude-standard 2>/dev/null; }
+
+test_files() {
+  local f
+  all_files | while IFS= read -r f; do
+    match_globs "$f" "$AIW_TEST_GLOBS" && echo "$f"
+  done
+}
+
+# Pliki zmienione od początku zadania (śledzone + nowe nieśledzone).
+changed_files() {
+  local base; base="$(base_commit)"
+  {
+    if [ -n "$base" ] && [ "$base" != "none" ]; then
+      git -C "$ROOT" diff --name-only "$base" 2>/dev/null
+    else
+      git -C "$ROOT" diff --name-only HEAD 2>/dev/null
+    fi
+    git -C "$ROOT" ls-files -o --exclude-standard 2>/dev/null
+  } | sort -u
+}
+
+# Odcisk stanu kodu — Stop hook nie uruchamia testów ponownie, gdy nic się nie zmieniło.
+fingerprint() {
+  local base; base="$(base_commit)"
+  [ -z "$base" ] || [ "$base" = "none" ] && base=HEAD
+  {
+    git -C "$ROOT" diff "$base" 2>/dev/null
+    git -C "$ROOT" ls-files -o --exclude-standard -z 2>/dev/null \
+      | (cd "$ROOT" && xargs -0 shasum 2>/dev/null)
+  } | shasum | cut -d' ' -f1
+}
+
+cmd_paths() {
+  echo "project_root: $ROOT"
+  echo "data_dir:     $PDIR"
+  echo "config:       $CONFIG"
+  local s; s="$(current_spec)"
+  [ -n "$s" ] && echo "spec:         $PDIR/specs/$s.md"
+  return 0
+}
+
+cmd_status() {
+  cmd_paths
+  if [ -f "$CONFIG" ]; then echo "config:       OK"; else echo "config:       BRAK (uruchom: aiw init)"; fi
+  echo "test_cmd:     ${AIW_TEST_CMD:-<nieustawiona>}"
+  if is_active; then echo "faza:         IMPLEMENTACJA (testy zablokowane)"
+  elif [ -n "$(current_spec)" ]; then echo "faza:         SPEC (testy edytowalne)"
+  else echo "faza:         brak aktywnego zadania"; fi
+  [ -f "$STATE/status" ] && echo "wynik testów: $(cat "$STATE/status")"
+  [ -f "$STATE/blocker" ] && echo "BLOKADA:      $(cat "$STATE/blocker")"
+  return 0
+}
+
+cmd_init() {
+  if [ -f "$CONFIG" ]; then echo "Config już istnieje: $CONFIG"; return 0; fi
+  cp "$AIW_TOOL_DIR/templates/config.sh" "$CONFIG"
+  echo "Utworzono: $CONFIG"
+  echo "Uzupełnij AIW_TEST_CMD (scheme, workspace/projekt, symulator)."
+}
+
+cmd_begin() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || fail "podaj nazwę zadania, np. aiw begin login-face-id"
+  is_active && fail "trwa implementacja '$(current_spec)'. Najpierw /finish."
+  slug="$(echo "$slug" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9._-]//g')"
+  echo "$slug" > "$STATE/current"
+  git -C "$ROOT" rev-parse HEAD > "$STATE/base" 2>/dev/null || echo none > "$STATE/base"
+  rm -f "$STATE/status" "$STATE/blocker" "$STATE/fingerprint" "$STATE/stop_count"
+  local spec="$PDIR/specs/$slug.md"
+  [ -f "$spec" ] || cp "$AIW_TOOL_DIR/templates/spec.md" "$spec"
+  echo "Zadanie:   $slug"
+  echo "Spec:      $spec"
+  echo "Baza diff: $(cat "$STATE/base")"
+  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    echo "UWAGA: drzewo robocze ma niezacommitowane zmiany — wejdą do diffu audytu."
+  fi
+}
+
+cmd_lock() {
+  [ -f "$CONFIG" ] || fail "brak configu projektu ($CONFIG). Uruchom najpierw /spec."
+  [ -n "$AIW_TEST_CMD" ] || fail "AIW_TEST_CMD nie jest ustawione w $CONFIG"
+  [ -n "$(current_spec)" ] || fail "brak aktywnego zadania. Zacznij od /spec <opis>."
+  if is_active; then
+    # Ponowne /implement = kontynuacja: nowa pula prób, blokada agenta wyczyszczona.
+    rm -f "$STATE/blocker" "$STATE/stop_count" "$STATE/status"
+    echo "Testy są już zablokowane dla '$(current_spec)'. Kontynuacja implementacji."
+    echo "Spec: $PDIR/specs/$(current_spec).md"
+    return 0
+  fi
+  local list="$STATE/tests.list"
+  test_files > "$list"
+  [ -s "$list" ] || fail "nie znaleziono plików testowych pasujących do: $AIW_TEST_GLOBS"
+  (cd "$ROOT" && tr '\n' '\0' < "$list" | xargs -0 shasum) > "$STATE/tests.sha"
+  (cd "$ROOT" && tar -cf "$STATE/tests.tar" -T "$list")
+  echo "$(current_spec)" > "$STATE/active"
+  rm -f "$STATE/status" "$STATE/blocker" "$STATE/fingerprint" "$STATE/stop_count"
+  echo "Zablokowano $(wc -l < "$list" | tr -d ' ') plików testowych dla '$(current_spec)'."
+  echo "Spec: $PDIR/specs/$(current_spec).md"
+}
+
+# check-tests [--restore] — wykrywa zmiany zablokowanych testów; z --restore przywraca je.
+cmd_check_tests() {
+  is_active || return 0
+  local bad
+  bad="$(cd "$ROOT" && shasum -c "$STATE/tests.sha" 2>/dev/null | grep -v ': OK$' | sed 's/: .*//')"
+  [ -z "$bad" ] && return 0
+  echo "$bad"
+  if [ "${1:-}" = "--restore" ]; then
+    (cd "$ROOT" && tar -xf "$STATE/tests.tar")
+  fi
+  return 1
+}
+
+cmd_blocker() {
+  is_active || fail "brak aktywnej implementacji"
+  [ -n "$*" ] || fail "opisz blokadę, np. aiw blocker \"test X wymaga Y, co jest sprzeczne z AC-2\""
+  echo "$*" > "$STATE/blocker"
+  echo "Zapisano blokadę. Zatrzymaj się i opisz problem użytkownikowi."
+}
+
+cmd_test() {
+  [ -n "$AIW_TEST_CMD" ] || fail "AIW_TEST_CMD nie jest ustawione w $CONFIG"
+  local log="$STATE/last-test.log"
+  (cd "$ROOT" && eval "$AIW_TEST_CMD") > "$log" 2>&1
+  local rc=$?
+  echo "$rc" > "$STATE/last-test.rc"
+  return $rc
+}
+
+# Najważniejsze linie z logu xcodebuild (błędy kompilacji, nieudane testy).
+cmd_test_summary() {
+  local log="$STATE/last-test.log"
+  [ -f "$log" ] || return 0
+  grep -E "error:|failed|FAILED|✘|Expectation failed|XCTAssert|recorded an issue|fatal" "$log" \
+    | grep -v "^note:" | head -40
+  echo "--- koniec logu ---"
+  tail -8 "$log"
+  echo "(pełny log: $log)"
+}
+
+cmd_changed() { changed_files; }
+
+cmd_risk() {
+  [ -n "$AIW_HIGH_RISK_GLOBS" ] || return 0
+  local f
+  changed_files | while IFS= read -r f; do
+    match_globs "$f" "$AIW_HIGH_RISK_GLOBS" && echo "$f"
+  done
+}
+
+# Nowe pliki testowe dodane w trakcie implementacji (poza zablokowanym zestawem).
+cmd_new_tests() {
+  is_active || return 0
+  test_files | grep -vxF -f "$STATE/tests.list" || true
+}
+
+cmd_diffstat() {
+  local base; base="$(base_commit)"
+  [ -z "$base" ] || [ "$base" = "none" ] && base=HEAD
+  git -C "$ROOT" diff --stat "$base" 2>/dev/null
+  local untracked; untracked="$(git -C "$ROOT" ls-files -o --exclude-standard 2>/dev/null)"
+  [ -n "$untracked" ] && { echo "Nowe pliki (nieśledzone):"; echo "$untracked" | sed 's/^/  /'; }
+  echo "Baza: $base"
+}
+
+cmd_report() {
+  echo "Zadanie:        $(current_spec)"
+  echo "Spec:           $PDIR/specs/$(current_spec).md"
+  echo "Wynik testów:   $(cat "$STATE/status" 2>/dev/null || echo 'nie uruchomiono')"
+  [ -f "$STATE/blocker" ] && echo "BLOKADA agenta: $(cat "$STATE/blocker")"
+  local risk; risk="$(cmd_risk)"
+  if [ -n "$risk" ]; then
+    echo "WYSOKIE RYZYKO — przeczytaj diff tych plików:"
+    echo "$risk" | sed 's/^/  /'
+  else
+    echo "Pliki wysokiego ryzyka: brak"
+  fi
+  local nt; nt="$(cmd_new_tests)"
+  [ -n "$nt" ] && { echo "Testy dodane podczas implementacji (niezatwierdzone przez Ciebie):"; echo "$nt" | sed 's/^/  /'; }
+  echo
+  cmd_diffstat
+}
+
+cmd_finish() {
+  is_active || [ -n "$(current_spec)" ] || fail "brak aktywnego zadania"
+  local tamper=""
+  is_active && tamper="$(cmd_check_tests)"
+  cmd_report
+  [ -n "$tamper" ] && { echo "UWAGA: zablokowane testy różnią się od zatwierdzonych:"; echo "$tamper" | sed 's/^/  /'; }
+  rm -f "$STATE/active" "$STATE/current" "$STATE/stop_count" "$STATE/fingerprint"
+  echo
+  echo "Odblokowano testy. Zadanie zamknięte."
+}
+
+case "${1:-status}" in
+  paths) cmd_paths ;;
+  status) cmd_status ;;
+  init) cmd_init ;;
+  begin) shift; cmd_begin "$@" ;;
+  lock) cmd_lock ;;
+  check-tests) shift; cmd_check_tests "$@" ;;
+  blocker) shift; cmd_blocker "$@" ;;
+  test) cmd_test ;;
+  test-summary) cmd_test_summary ;;
+  changed) cmd_changed ;;
+  risk) cmd_risk ;;
+  new-tests) cmd_new_tests ;;
+  diffstat) cmd_diffstat ;;
+  report) cmd_report ;;
+  finish) cmd_finish ;;
+  is-active) is_active ;;
+  fingerprint) fingerprint ;;
+  match-test) match_globs "$(rel_path "$2")" "$AIW_TEST_GLOBS" ;;
+  data-dir) echo "$AIW_DATA" ;;
+  root) echo "$ROOT" ;;
+  state-dir) echo "$STATE" ;;
+  max-blocks) echo "$AIW_MAX_STOP_BLOCKS" ;;
+  lint-cmd) echo "$AIW_LINT_CMD" ;;
+  *) echo "Użycie: aiw {status|paths|init|begin <nazwa>|lock|blocker <opis>|test|report|finish}"; exit 1 ;;
+esac
